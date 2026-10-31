@@ -1,0 +1,8 @@
+{
+  "name": "AegisField DQMS - Local-First Healthcare Queue Management",
+  "description": "Zero-cloud, mission-critical digital queue management system designed for field health camps and remote clinics with local SQLite persistence and real-time LAN synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
