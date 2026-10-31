@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../services/api';
-import { Patient, AuditEntry } from '../types/queue';
+import { Patient, AuditEntry, StationType } from '../types/queue';
 import { PrintableToken } from './PrintableToken';
 import { 
   Search, 
@@ -8,40 +8,121 @@ import {
   Clock, 
   Printer, 
   Activity, 
-  FileText, 
   CheckCircle2, 
-  ArrowRight,
-  Stethoscope,
-  Microscope,
-  Pill,
-  ShieldCheck
+  AlertCircle,
+  ShieldCheck,
+  Radio,
+  Users,
+  Building,
+  Volume2
 } from 'lucide-react';
 
-export const PatientTracker: React.FC = () => {
-  const [searchQuery, setSearchQuery] = useState('');
+interface PatientTrackerProps {
+  initialToken?: string;
+}
+
+export const PatientTracker: React.FC<PatientTrackerProps> = ({ initialToken }) => {
+  const [searchQuery, setSearchQuery] = useState(initialToken || '');
   const [searchResults, setSearchResults] = useState<Patient[]>([]);
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
   const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [showPrintModal, setShowPrintModal] = useState(false);
+  
+  // Real-time queue metrics for the tracked token
+  const [patientsAhead, setPatientsAhead] = useState<number | null>(null);
+  const [totalStationWaiting, setTotalStationWaiting] = useState<number | null>(null);
 
-  const handleSearch = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!searchQuery.trim()) return;
+  // Parse token from either hash (#tracker?token=GEN-110) or query string (?token=GEN-110)
+  const extractTokenFromUrl = (): string => {
+    if (initialToken) return initialToken;
 
+    // 1. Check window.location.hash
+    if (typeof window !== 'undefined' && window.location.hash) {
+      const hash = window.location.hash.replace(/^#/, '');
+      const queryIdx = hash.indexOf('?');
+      if (queryIdx !== -1) {
+        const queryStr = hash.substring(queryIdx + 1);
+        const params = new URLSearchParams(queryStr);
+        const tok = params.get('token');
+        if (tok) return tok;
+      }
+    }
+
+    // 2. Check window.location.search
+    if (typeof window !== 'undefined' && window.location.search) {
+      const params = new URLSearchParams(window.location.search);
+      const tok = params.get('token');
+      if (tok) return tok;
+    }
+
+    return '';
+  };
+
+  // Perform token lookup and load patient details
+  const lookupToken = async (tok: string) => {
+    if (!tok.trim()) return;
     setIsLoading(true);
     try {
-      const results = await api.searchPatients(searchQuery.trim());
+      const results = await api.searchPatients(tok.trim());
       setSearchResults(results);
-      if (results.length > 0) {
-        loadPatientDetails(results[0].id);
+
+      // Match exact token number if available, else first result
+      const matched = results.find(p => p.token_number.toLowerCase() === tok.trim().toLowerCase()) || results[0];
+      if (matched) {
+        await loadPatientDetails(matched.id);
       } else {
         setSelectedPatient(null);
+        setPatientsAhead(null);
       }
     } catch (err) {
-      console.error(err);
+      console.error('Error looking up token:', err);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // Calculate patients ahead in queue
+  const calculateQueuePosition = async (patient: Patient) => {
+    if (patient.status === 'COMPLETED' || patient.status === 'CANCELLED') {
+      setPatientsAhead(0);
+      setTotalStationWaiting(0);
+      return;
+    }
+
+    if (patient.status === 'CALLED' || patient.status === 'IN_SERVICE') {
+      setPatientsAhead(0);
+      setTotalStationWaiting(0);
+      return;
+    }
+
+    try {
+      const stationQueue = await api.getQueue(patient.current_station, patient.department);
+      const waitingList = stationQueue.filter(p => p.status === 'WAITING');
+      setTotalStationWaiting(waitingList.length);
+
+      const priorityWeight: Record<string, number> = {
+        'URGENT': 1,
+        'ELDERLY': 2,
+        'PREGNANT': 3,
+        'PEDIATRIC': 4,
+        'NORMAL': 5
+      };
+
+      const myWeight = priorityWeight[patient.priority] || 5;
+
+      // Count how many are ahead of this patient
+      const aheadCount = waitingList.filter(other => {
+        if (other.id === patient.id) return false;
+        const otherWeight = priorityWeight[other.priority] || 5;
+        if (otherWeight < myWeight) return true;
+        if (otherWeight === myWeight && other.queued_at < patient.queued_at) return true;
+        return false;
+      }).length;
+
+      setPatientsAhead(aheadCount);
+    } catch (err) {
+      console.warn('Failed to calculate queue position:', err);
     }
   };
 
@@ -51,6 +132,7 @@ export const PatientTracker: React.FC = () => {
       const full = await api.getPatientDetails(id);
       setSelectedPatient(full);
       setAuditLog((full as any).audit || []);
+      await calculateQueuePosition(full);
     } catch (err) {
       console.error(err);
     } finally {
@@ -58,16 +140,77 @@ export const PatientTracker: React.FC = () => {
     }
   };
 
+  // On mount and URL change, check for token parameter
+  useEffect(() => {
+    const urlToken = extractTokenFromUrl();
+    if (urlToken) {
+      setSearchQuery(urlToken);
+      lookupToken(urlToken);
+    }
+
+    const handleHashChange = () => {
+      const newTok = extractTokenFromUrl();
+      if (newTok) {
+        setSearchQuery(newTok);
+        lookupToken(newTok);
+      }
+    };
+
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, [initialToken]);
+
+  // Subscribe to real-time WebSocket events to update position live
+  useEffect(() => {
+    const unsubscribe = api.subscribe((msg) => {
+      if (msg.type === 'QUEUE_UPDATED' || msg.type === 'PATIENT_CALLED' || msg.type === 'INIT') {
+        if (selectedPatient) {
+          loadPatientDetails(selectedPatient.id);
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, [selectedPatient?.id]);
+
+  const handleSearch = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!searchQuery.trim()) return;
+    lookupToken(searchQuery.trim());
+  };
+
+  // Helper for station readable label
+  const getStationLabel = (st: StationType) => {
+    switch (st) {
+      case 'TRIAGE': return 'Triage Desk (Vitals)';
+      case 'CONSULTATION': return 'Doctor Consultation';
+      case 'LAB': return 'Diagnostic Lab';
+      case 'PHARMACY': return 'Pharmacy & Dispensary';
+      case 'DISCHARGED': return 'Discharged / Completed';
+      default: return st;
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto px-6 py-8">
       {/* Header */}
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-          Patient Audit Trail & Journey Tracker
-        </h1>
-        <p className="text-sm text-slate-500 mt-0.5">
-          Look up token records, chronological stage timestamps, recorded vitals, and physician notes
-        </p>
+      <div className="mb-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+            Live Patient & Queue Tracker
+          </h1>
+          <p className="text-sm text-slate-500 mt-0.5">
+            Real-time token status, queue position, station progress, and clinical records
+          </p>
+        </div>
+
+        {selectedPatient && (
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              Live Sync Active
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Search Input Bar */}
@@ -85,24 +228,137 @@ export const PatientTracker: React.FC = () => {
         <button
           type="submit"
           disabled={isLoading}
-          className="px-6 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-xl transition-colors cursor-pointer shrink-0"
+          className="px-6 py-2.5 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-50 rounded-xl transition-colors cursor-pointer shrink-0"
         >
-          Track Journey
+          {isLoading ? 'Checking...' : 'Track Token'}
         </button>
       </form>
 
+      {/* Prominent Live Queue Status Banner when patient is selected */}
+      {selectedPatient && (
+        <div className="mb-8 bg-white border-2 border-slate-900 rounded-2xl p-6 shadow-md overflow-hidden relative">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6 items-center">
+            {/* 1. Token Number & Department */}
+            <div className="border-b md:border-b-0 md:border-r border-slate-200 pb-4 md:pb-0 md:pr-4">
+              <span className="text-xs uppercase tracking-wider font-semibold text-slate-500 block">
+                Current Token Number
+              </span>
+              <div className="text-4xl sm:text-5xl font-black font-mono text-slate-950 mt-1 tabular-nums">
+                {selectedPatient.token_number}
+              </div>
+              <div className="text-xs font-semibold text-slate-700 mt-1">
+                {selectedPatient.name} · {selectedPatient.department}
+              </div>
+            </div>
+
+            {/* 2. Assigned Station / Department */}
+            <div className="border-b md:border-b-0 md:border-r border-slate-200 pb-4 md:pb-0 md:pr-4">
+              <span className="text-xs uppercase tracking-wider font-semibold text-slate-500 block">
+                Assigned Station
+              </span>
+              <div className="text-xl font-bold text-slate-900 mt-1 flex items-center gap-2">
+                <Building className="w-5 h-5 text-slate-700 shrink-0" />
+                <span>{getStationLabel(selectedPatient.current_station)}</span>
+              </div>
+              <div className="text-xs text-slate-500 mt-1">
+                {selectedPatient.current_counter ? `Assigned to ${selectedPatient.current_counter}` : 'Waiting for counter assignment'}
+              </div>
+            </div>
+
+            {/* 3. Queue Status */}
+            <div className="border-b md:border-b-0 md:border-r border-slate-200 pb-4 md:pb-0 md:pr-4">
+              <span className="text-xs uppercase tracking-wider font-semibold text-slate-500 block">
+                Queue Status
+              </span>
+              <div className="mt-1">
+                {selectedPatient.status === 'CALLED' ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-500 text-slate-950 font-bold text-sm rounded-lg uppercase tracking-wide animate-bounce">
+                    <Volume2 className="w-4 h-4" />
+                    Now Called!
+                  </span>
+                ) : selectedPatient.status === 'IN_SERVICE' ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-sky-500 text-white font-bold text-sm rounded-lg uppercase tracking-wide">
+                    <Activity className="w-4 h-4" />
+                    In Service
+                  </span>
+                ) : selectedPatient.status === 'COMPLETED' ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-600 text-white font-bold text-sm rounded-lg uppercase tracking-wide">
+                    <CheckCircle2 className="w-4 h-4" />
+                    Completed
+                  </span>
+                ) : selectedPatient.status === 'NO_SHOW' ? (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-red-100 text-red-800 font-bold text-sm rounded-lg uppercase tracking-wide">
+                    <AlertCircle className="w-4 h-4" />
+                    No-Show
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-slate-900 text-white font-bold text-sm rounded-lg uppercase tracking-wide">
+                    <Clock className="w-4 h-4" />
+                    Waiting
+                  </span>
+                )}
+              </div>
+              <div className="text-xs text-slate-500 mt-1">
+                Priority: <span className="font-semibold text-slate-800">{selectedPatient.priority}</span>
+              </div>
+            </div>
+
+            {/* 4. Patients Ahead In Line */}
+            <div>
+              <span className="text-xs uppercase tracking-wider font-semibold text-slate-500 block">
+                Patients Ahead In Line
+              </span>
+              <div className="flex items-baseline gap-2 mt-1">
+                {selectedPatient.status === 'WAITING' ? (
+                  <>
+                    <span className="text-4xl font-black font-mono text-slate-950 tabular-nums">
+                      {patientsAhead !== null ? patientsAhead : '--'}
+                    </span>
+                    <span className="text-xs font-semibold text-slate-600">
+                      {patientsAhead === 0 ? 'You are next in line!' : 'patients ahead of you'}
+                    </span>
+                  </>
+                ) : selectedPatient.status === 'CALLED' ? (
+                  <span className="text-sm font-bold text-amber-700">
+                    Proceed immediately to {selectedPatient.current_counter || 'station counter'}
+                  </span>
+                ) : selectedPatient.status === 'IN_SERVICE' ? (
+                  <span className="text-sm font-bold text-sky-700">
+                    Currently in examination room
+                  </span>
+                ) : selectedPatient.status === 'COMPLETED' ? (
+                  <span className="text-sm font-bold text-emerald-700">
+                    Camp visit complete · Medications received
+                  </span>
+                ) : (
+                  <span className="text-sm font-medium text-slate-500">
+                    Please contact registration desk
+                  </span>
+                )}
+              </div>
+              {selectedPatient.status === 'WAITING' && totalStationWaiting !== null && (
+                <div className="text-[11px] text-slate-400 mt-1">
+                  Total {totalStationWaiting} waiting at this station
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Main Grid: Search results & full timeline */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
         {/* Left Column: Search Results List (4 cols) */}
         <div className="lg:col-span-4 bg-white rounded-xl border border-slate-200 p-5 shadow-xs flex flex-col h-[580px]">
           <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500 pb-3 border-b border-slate-100 mb-2">
-            Matching Patients ({searchResults.length})
+            Matching Records ({searchResults.length})
           </h2>
 
           <div className="flex-1 overflow-y-auto space-y-1.5 divide-y divide-slate-100 pr-1">
             {searchResults.length === 0 ? (
               <div className="h-48 flex flex-col items-center justify-center text-slate-400 text-xs">
                 <User className="w-8 h-8 text-slate-300 mb-2 stroke-[1.5]" />
-                <span>Search for a token or name to view record</span>
+                <span>Search for a token or scan receipt QR code</span>
               </div>
             ) : (
               searchResults.map((p) => {
@@ -131,7 +387,7 @@ export const PatientTracker: React.FC = () => {
                     </div>
 
                     <div className={`text-[11px] mt-0.5 ${isSelected ? 'text-slate-400' : 'text-slate-500'}`}>
-                      {p.department} · Station: {p.current_station}
+                      {p.department} · {getStationLabel(p.current_station)}
                     </div>
                   </div>
                 );
@@ -144,26 +400,14 @@ export const PatientTracker: React.FC = () => {
         <div className="lg:col-span-8 space-y-6">
           {selectedPatient ? (
             <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-xs space-y-6">
-              {/* Header Card */}
+              {/* Patient Header Strip */}
               <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between pb-4 border-b border-slate-200 gap-3">
                 <div>
-                  <div className="flex items-center gap-3">
-                    <span className="text-3xl font-extrabold font-mono text-slate-950 tabular-nums">
-                      {selectedPatient.token_number}
-                    </span>
-                    <span className={`text-xs font-bold uppercase px-2.5 py-0.5 rounded ${
-                      selectedPatient.status === 'COMPLETED' ? 'bg-emerald-100 text-emerald-800' :
-                      selectedPatient.status === 'IN_SERVICE' ? 'bg-sky-100 text-sky-800' :
-                      selectedPatient.status === 'CALLED' ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-700'
-                    }`}>
-                      {selectedPatient.status.replace('_', ' ')}
-                    </span>
-                  </div>
-                  <h2 className="text-base font-bold text-slate-900 mt-1">
+                  <h2 className="text-lg font-bold text-slate-900">
                     {selectedPatient.name} ({selectedPatient.age} Y · {selectedPatient.gender === 'M' ? 'Male' : selectedPatient.gender === 'F' ? 'Female' : 'Other'})
                   </h2>
-                  <p className="text-xs text-slate-500">
-                    Specialty: {selectedPatient.department} · Priority: {selectedPatient.priority}
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Admitted: {new Date(selectedPatient.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · Priority: {selectedPatient.priority}
                   </p>
                 </div>
 
@@ -172,7 +416,7 @@ export const PatientTracker: React.FC = () => {
                   className="px-4 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg flex items-center gap-1.5 shadow-xs transition-colors self-start cursor-pointer"
                 >
                   <Printer className="w-3.5 h-3.5" />
-                  <span>Reprint Slip</span>
+                  <span>Reprint Receipt</span>
                 </button>
               </div>
 
@@ -239,7 +483,7 @@ export const PatientTracker: React.FC = () => {
                         </div>
 
                         <p className="text-slate-600 mt-0.5">
-                          Station: <span className="font-medium text-slate-800">{log.station}</span> ({log.counter})
+                          Station: <span className="font-medium text-slate-800">{getStationLabel(log.station as StationType)}</span> ({log.counter})
                         </p>
 
                         {log.details && (
@@ -254,8 +498,8 @@ export const PatientTracker: React.FC = () => {
           ) : (
             <div className="bg-white rounded-xl border border-slate-200 p-12 text-center text-slate-400 shadow-xs">
               <ShieldCheck className="w-10 h-10 mx-auto text-slate-300 mb-2" />
-              <p className="text-sm font-medium text-slate-600">Select or search for a patient record</p>
-              <p className="text-xs text-slate-400 mt-1">Full journey from intake to discharge will appear here</p>
+              <p className="text-sm font-medium text-slate-600">No patient selected</p>
+              <p className="text-xs text-slate-400 mt-1">Enter a token number above or scan your receipt QR code to view live status</p>
             </div>
           )}
         </div>

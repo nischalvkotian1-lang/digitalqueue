@@ -11,22 +11,59 @@ import { CampMeta } from './types/queue';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('register');
+  const [trackedToken, setTrackedToken] = useState<string>('');
   const [isLanModalOpen, setIsLanModalOpen] = useState(false);
   const [isWsConnected, setIsWsConnected] = useState(false);
   const [meta, setMeta] = useState<CampMeta | null>(null);
 
-  // Sync with URL hash or path for TV sticks / bookmarking (e.g. /#display or /#station)
+  // Sync with URL hash or query params (e.g. /#tracker?token=GEN-110, ?token=GEN-110, /#display)
   useEffect(() => {
-    const handleHash = () => {
-      const hash = window.location.hash.replace('#', '') as NavTab;
-      if (['register', 'station', 'display', 'analytics', 'tracker'].includes(hash)) {
-        setActiveTab(hash);
+    const handleUrlRouting = () => {
+      let route: NavTab | null = null;
+      let token = '';
+
+      // 1. Check search params: ?token=GEN-110
+      if (typeof window !== 'undefined' && window.location.search) {
+        const searchParams = new URLSearchParams(window.location.search);
+        const searchToken = searchParams.get('token');
+        if (searchToken) {
+          token = searchToken;
+          route = 'tracker';
+        }
+      }
+
+      // 2. Check hash route: #tracker?token=GEN-110 or #display or #station
+      if (typeof window !== 'undefined' && window.location.hash) {
+        const rawHash = window.location.hash.replace(/^#/, '');
+        const [hashRoute, hashQuery] = rawHash.split('?');
+        if (['register', 'station', 'display', 'analytics', 'tracker'].includes(hashRoute)) {
+          route = hashRoute as NavTab;
+        }
+        if (hashQuery) {
+          const hashParams = new URLSearchParams(hashQuery);
+          const hashToken = hashParams.get('token');
+          if (hashToken) {
+            token = hashToken;
+            route = 'tracker';
+          }
+        }
+      }
+
+      if (route) {
+        setActiveTab(route);
+      }
+      if (token) {
+        setTrackedToken(token);
       }
     };
 
-    handleHash();
-    window.addEventListener('hashchange', handleHash);
-    return () => window.removeEventListener('hashchange', handleHash);
+    handleUrlRouting();
+    window.addEventListener('hashchange', handleUrlRouting);
+    window.addEventListener('popstate', handleUrlRouting);
+    return () => {
+      window.removeEventListener('hashchange', handleUrlRouting);
+      window.removeEventListener('popstate', handleUrlRouting);
+    };
   }, []);
 
   const handleTabChange = (tab: NavTab) => {
@@ -75,7 +112,7 @@ export default function App() {
         {activeTab === 'station' && <StationOperatorPortal />}
         {activeTab === 'display' && <PublicDisplayBoard />}
         {activeTab === 'analytics' && <AnalyticsPortal meta={meta} onMetaUpdated={loadMeta} />}
-        {activeTab === 'tracker' && <PatientTracker />}
+        {activeTab === 'tracker' && <PatientTracker initialToken={trackedToken} />}
       </main>
 
       {/* LAN Setup Modal */}
